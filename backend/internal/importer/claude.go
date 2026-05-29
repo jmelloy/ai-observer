@@ -118,6 +118,8 @@ type claudeJSONLEntry struct {
 	// System entry fields (present when type == "system")
 	Subtype    string  `json:"subtype,omitempty"`
 	DurationMs float64 `json:"durationMs,omitempty"`
+	// Worktree-state fields (present when type == "worktree-state")
+	WorktreeSession *claudeWorktreeSession `json:"worktreeSession,omitempty"`
 }
 
 type claudeMessage struct {
@@ -167,20 +169,28 @@ type claudeMultiEditInput struct {
 	} `json:"edits"`
 }
 
+// claudeWorktreeSession holds fields from a "worktree-state" entry's worktreeSession object.
+type claudeWorktreeSession struct {
+	OriginalCwd string `json:"originalCwd,omitempty"`
+}
+
 // claudeSessionMeta holds session-level metadata collected in a first pass
 type claudeSessionMeta struct {
-	GitBranch    string
-	Cwd          string
-	PRNumber     int
-	PRUrl        string
-	PRRepository string
-	PRTimestamp  time.Time
+	GitBranch      string
+	Cwd            string
+	OriginalCwd    string   // from worktree-state.worktreeSession.originalCwd
+	CandidateRepos []string // owner/repo references from pr-link entries (most-frequent first)
+	PRNumber       int
+	PRUrl          string
+	PRRepository   string
+	PRTimestamp    time.Time
 }
 
 // collectSessionMeta does a first pass over raw JSONL lines to collect session-level metadata
 func (p *ClaudeParser) collectSessionMeta(lines []string) claudeSessionMeta {
 	meta := claudeSessionMeta{}
 	seenPRs := make(map[int]bool)
+	seenRepos := make(map[string]bool)
 
 	for _, line := range lines {
 		var entry claudeJSONLEntry
@@ -193,9 +203,19 @@ func (p *ClaudeParser) collectSessionMeta(lines []string) claudeSessionMeta {
 		if entry.Cwd != "" && meta.Cwd == "" {
 			meta.Cwd = entry.Cwd
 		}
+		if entry.Type == "worktree-state" && entry.WorktreeSession != nil {
+			if oc := entry.WorktreeSession.OriginalCwd; oc != "" && meta.OriginalCwd == "" {
+				meta.OriginalCwd = oc
+			}
+		}
 		if entry.Type == "pr-link" && entry.PRNumber != 0 && !seenPRs[entry.PRNumber] {
 			seenPRs[entry.PRNumber] = true
-			// Use the first PR linked in the session
+			// Collect all pr-link repositories as candidates for resolution.
+			if r := entry.PRRepository; r != "" && !seenRepos[r] {
+				seenRepos[r] = true
+				meta.CandidateRepos = append(meta.CandidateRepos, r)
+			}
+			// Use the first PR linked in the session for structured PR metadata.
 			if meta.PRNumber == 0 {
 				meta.PRNumber = entry.PRNumber
 				meta.PRUrl = entry.PRUrl
@@ -211,16 +231,17 @@ func (p *ClaudeParser) collectSessionMeta(lines []string) claudeSessionMeta {
 	return meta
 }
 
-// extractRepository returns a repository identifier from session metadata.
-// Uses prRepository if set (e.g. "org/repo"), otherwise derives from the last cwd component.
+// extractRepository returns the best repository identifier for a session.
+//
+// Priority:
+//  1. PRRepository from a structured pr-link entry (authoritative — this is
+//     exactly where the linked PR lives, not just a text-mined reference).
+//  2. resolveSessionRepository: on-disk git remote → matching candidate → cwd name.
 func extractRepository(meta claudeSessionMeta) string {
 	if meta.PRRepository != "" {
 		return meta.PRRepository
 	}
-	if meta.Cwd != "" {
-		return filepath.Base(meta.Cwd)
-	}
-	return ""
+	return resolveSessionRepository(meta.CandidateRepos, "", meta.OriginalCwd, meta.Cwd)
 }
 
 // countLines returns the number of lines in s (at least 1 for non-empty strings)
